@@ -1,5 +1,6 @@
 
--- Copyright (C) Yichun Zhang (agentzh). BSD License.
+-- DNS Resolver in Lua.
+-- Written by Yichun Zhang (agentzh). BSD License.
 -- Modified by Cosmin Apreutesei. Public Domain.
 
 local bit = require "bit"
