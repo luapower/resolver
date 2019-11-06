@@ -76,6 +76,14 @@ It accepts a `opts` table argument. The following options are supported:
 	a boolean flag controls whether to disable the "recursion desired" (RD)
 	flag in the UDP request. Defaults to `false`.
 
+* `async`
+
+	a boolean flag indicating that sockets shoud be wrapped by [socketloop].
+* `tcp`, `udp`, `tcp_async`, `udp_async`
+
+	alternative socket constructors, defaulting to [socket] tcp and udp
+	constructors. Can also be set at module level.
+
 ### `r:query(name, [options], [tries]) -> answers, err, tries`
 
 Perform a DNS standard query to the nameservers specified by the `new` method,
