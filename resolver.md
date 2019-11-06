@@ -14,10 +14,20 @@ properly seeded using `math.randomseed` prior to using this module.
 
 This library is considered production ready.
 
+## API
+
+------------------------------------------------------------- ----------------
+`resolver.new(opts) -> r, err`                                create a resolver object
+`r:query(name, [options], [tries]) -> answers, err, tries`    query DNS
+`r:tcp_query(name, [options]) -> answers, err`                query DNS via TCP
+`r:set_timeout(time)`                                         set timeout
+`resolver.arpa_str(address) -> arpa_record`
+`r:reverse_query(address) -> answers, err`
+------------------------------------------------------------- ----------------
+
 ## Usage
 
 ```lua
-local resolver = require "resty.dns.resolver"
 local r, err = resolver:new{
 	 nameservers = {"8.8.8.8", {"8.8.4.4", 53} },
 	 retrans = 5,  -- 5 retransmissions on receive timeout
@@ -52,9 +62,7 @@ end
 
 ### `resolver.new(opts) -> r, err`
 
-`syntax: r, err = resolver:new(opts)`
-
-Creates a dns.resolver object. Returns `nil` and an message string on error.
+Creates a resolver object. Returns `nil` and an message string on error.
 
 It accepts a `opts` table argument. The following options are supported:
 
@@ -73,7 +81,7 @@ It accepts a `opts` table argument. The following options are supported:
 
 ### `r:query(name, [options], [tries]) -> answers, err, tries`
 
-Performs a DNS standard query to the nameservers specified by the `new` method,
+Perform a DNS standard query to the nameservers specified by the `new` method,
 and returns all the answer records in an array-like Lua table. In case of errors, it will
 return `nil` and a string describing the error instead.
 
@@ -151,235 +159,60 @@ All TCP connections are short lived.
 Here is an example:
 
 ```lua
-local resolver = require "resty.dns.resolver"
-
-local r, err = resolver:new{
-	nameservers = { "8.8.8.8" }
-}
-if not r then
-	ngx.say("failed to instantiate resolver: ", err)
-	return
-end
-
-local ans, err = r:tcp_query("www.google.com", { qtype = r.TYPE_A })
+local r, err = assert(resolver:new{
+	nameservers = { '8.8.8.8' }
+})
+local ans, err = r:tcp_query('www.google.com', { qtype = r.TYPE_A })
 if not ans then
 	ngx.say("failed to query: ", err)
 	return
 end
-
-local cjson = require "cjson"
-ngx.say("records: ", cjson.encode(ans))
 ```
 
 ### `r:set_timeout(time)`
 
-Overrides the current `timeout` setting by the `time` argument in milliseconds
+Overrides the current `timeout` setting by the `time` argument in seconds
 for all the nameserver peers.
 
-### `resty.dns.resolver.compress_ipv6_addr(address) -> compressed`
+### `resolver.arpa_str(address) -> arpa_record`
 
-Compresses the successive 16-bit zero groups in the textual format of the IPv6 address.
-
-For example,
-
-```lua
-local resolver = require "resty.dns.resolver"
-local compress = resolver.compress_ipv6_addr
-local new_addr = compress("FF01:0:0:0:0:0:0:101")
-```
-
-will yield `FF01::101` in the `new_addr` return value.
-
-[Back to TOC](#table-of-contents)
-
-expand_ipv6_addr
-------------------
-`syntax: expanded = resty.dns.resolver.expand_ipv6_addr(address)`
-
-Expands the successive 16-bit zero groups in the textual format of the IPv6 address.
+Generates the reverse domain name for PTR lookups for both IPv4 and IPv6
+addresses. Compressed IPv6 addresses will be automatically expanded.
 
 For example,
 
 ```lua
-    local resolver = require "resty.dns.resolver"
-    local expand = resolver.expand_ipv6_addr
-    local new_addr = expand("FF01::101")
+local ptr4 = resolver.arpa_str'1.2.3.4'
+local ptr6 = resolver.arpa_str'FF01::101'
 ```
 
-will yield `FF01:0:0:0:0:0:0:101` in the `new_addr` return value.
+will yield `4.3.2.1.in-addr.arpa` for `ptr4` and
+`1.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.F.F.ip6.arpa` for `ptr6`.
 
-[Back to TOC](#table-of-contents)
+### `r:reverse_query(address) -> answers, err`
 
-arpa_str
-------------------
-`syntax: arpa_record = resty.dns.resolver.arpa_str(address)`
+Performs a PTR lookup for both IPv4 and IPv6 addresses. This function is
+basically a wrapper for the `query` command which uses the `arpa_str` command
+to convert the IP address on the fly.
 
-Generates the reverse domain name for PTR lookups for both IPv4 and IPv6 addresses. Compressed IPv6 addresses
-will be automatically expanded.
+### Constants
 
-For example,
-
-```lua
-    local resolver = require "resty.dns.resolver"
-    local ptr4 = resolver.arpa_str("1.2.3.4")
-    local ptr6 = resolver.arpa_str("FF01::101")
-```
-
-will yield `4.3.2.1.in-addr.arpa` for `ptr4` and `1.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.F.F.ip6.arpa` for `ptr6`.
-
-[Back to TOC](#table-of-contents)
-
-reverse_query
-------------------
-`syntax: answers, err = r:reverse_query(address)`
-
-Performs a PTR lookup for both IPv4 and IPv6 addresses. This function is basically a wrapper for the `query` command
-which uses the `arpa_str` command to convert the IP address on the fly.
-
-[Back to TOC](#table-of-contents)
-
-Constants
-=========
-
-[Back to TOC](#table-of-contents)
-
-TYPE_A
-------
-
-The `A` resource record type, equal to the decimal number `1`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_NS
--------
-
-The `NS` resource record type, equal to the decimal number `2`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_CNAME
-----------
-
-The `CNAME` resource record type, equal to the decimal number `5`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_SOA
-----------
-
-The `SOA` resource record type, equal to the decimal number `6`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_PTR
---------
-
-The `PTR` resource record type, equal to the decimal number `12`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_MX
--------
-
-The `MX` resource record type, equal to the decimal number `15`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_TXT
---------
-
-The `TXT` resource record type, equal to the decimal number `16`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_AAAA
----------
-`syntax: typ = r.TYPE_AAAA`
-
-The `AAAA` resource record type, equal to the decimal number `28`.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_SRV
----------
-`syntax: typ = r.TYPE_SRV`
-
-The `SRV` resource record type, equal to the decimal number `33`.
-
-See RFC 2782 for details.
-
-[Back to TOC](#table-of-contents)
-
-TYPE_SPF
----------
-`syntax: typ = r.TYPE_SPF`
-
-The `SPF` resource record type, equal to the decimal number `99`.
-
-See RFC 4408 for details.
-
-[Back to TOC](#table-of-contents)
-
-CLASS_IN
---------
-`syntax: class = r.CLASS_IN`
-
-The `Internet` resource record type, equal to the decimal number `1`.
-
-[Back to TOC](#table-of-contents)
-
-SECTION_AN
-----------
-`syntax: stype = r.SECTION_AN`
-
-Identifier of the `Answer` section in the DNS response. Equal to decimal number `1`.
-
-[Back to TOC](#table-of-contents)
-
-SECTION_NS
-----------
-`syntax: stype = r.SECTION_NS`
-
-Identifier of the `Authority` section in the DNS response. Equal to the decimal number `2`.
-
-[Back to TOC](#table-of-contents)
-
-SECTION_AR
-----------
-`syntax: stype = r.SECTION_AR`
-
-Idnetifier of the `Additional` section in the DNS response. Equal to the decimal number `3`.
-
-[Back to TOC](#table-of-contents)
-
-Automatic Error Logging
-=======================
-
-By default the underlying [ngx_lua](https://github.com/openresty/lua-nginx-module/#readme) module
-does error logging when socket errors happen. If you are already doing proper error
-handling in your own Lua code, then you are recommended to disable this automatic error logging by turning off [ngx_lua](https://github.com/openresty/lua-nginx-module/#readme)'s [lua_socket_log_errors](https://github.com/openresty/lua-nginx-module/#lua_socket_log_errors) directive, that is,
-
-```nginx
-    lua_socket_log_errors off;
-```
-
-[Back to TOC](#table-of-contents)
-
-Limitations
-===========
-
-* This library cannot be used in code contexts like `set_by_lua*`, `log_by_lua*`, and
-`header_filter_by_lua*` where the ngx_lua cosocket API is not available.
-* The `resty.dns.resolver` object instance cannot be stored in a Lua variable at the Lua module level,
-because it will then be shared by all the concurrent requests handled by the same nginx
- worker process (see
-https://github.com/openresty/lua-nginx-module/#data-sharing-within-an-nginx-worker ) and
-result in bad race conditions when concurrent requests are trying to use the same `resty.dns.resolver` instance.
-You should always initiate `resty.dns.resolver` objects in function local
-variables or in the `ngx.ctx` table. These places all have their own data copies for
-each request.
-
-[Back to TOC](#table-of-contents)
+-------------- ---------------------------------------------------------------
+`r.TYPE_A`     The `A` resource record type, equal to the decimal number `1`.
+`r.TYPE_NS`    The `NS` resource record type, equal to the decimal number `2`.
+`r.TYPE_CNAME` The `CNAME` resource record type, equal to the decimal number `5`.
+`r.TYPE_SOA`   The `SOA` resource record type, equal to the decimal number `6`.
+`r.TYPE_PTR`   The `PTR` resource record type, equal to the decimal number `12`.
+`r.TYPE_MX`    The `MX` resource record type, equal to the decimal number `15`.
+`r.TYPE_TXT`   The `TXT` resource record type, equal to the decimal number `16`.
+`r.TYPE_AAAA`  The `AAAA` resource record type, equal to the decimal number `28`.
+`r.TYPE_SRV`   The `SRV` resource record type, equal to the decimal number `33`. See RFC 2782 for details.
+`r.TYPE_SPF`   The `SPF` resource record type, equal to the decimal number `99`. See RFC 4408 for details.
+`r.CLASS_IN`   The `Internet` resource record type, equal to the decimal number `1`.
+`r.SECTION_AN` Identifier of the `Answer` section in the DNS response. Equal to decimal number `1`.
+`r.SECTION_NS` Identifier of the `Authority` section in the DNS response. Equal to the decimal number `2`.
+`r.SECTION_AR` Idnetifier of the `Additional` section in the DNS response. Equal to the decimal number `3`.
+-------------- ---------------------------------------------------------------
 
 ## TODO
 
