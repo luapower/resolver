@@ -1,927 +1,475 @@
 
--- DNS Resolver in Lua.
--- Copyright (C) Yichun Zhang (agentzh). BSD License.
--- Modified by Cosmin Apreutesei. Public Domain.
+-- DNS resolver in Lua.
+-- Written by Cosmin Apreutesei. Public Domain.
 
-local bit = require "bit"
-local rand = math.random
-local char = string.char
-local byte = string.byte
-local find = string.find
-local gsub = string.gsub
-local sub = string.sub
-local rep = string.rep
-local format = string.format
+local ffi      = require'ffi'
+local bit      = require'bit'
+local time     = require'time'.time
+local errors   = require'errors'
+local glue     = require'glue'
+local lrucache = require'lrucache'
+
 local band = bit.band
-local rshift = bit.rshift
-local lshift = bit.lshift
-local insert = table.insert
+local shr = bit.rshift
+local shl = bit.lshift
+local char = string.char
+local format = string.format
+local add = table.insert
 local concat = table.concat
-local unpack = unpack
-local setmetatable = setmetatable
-local type = type
-local ipairs = ipairs
 
-local ok, new_tab = pcall(require, "table.new")
-if not ok then
-    new_tab = function (narr, nrec) return {} end
+local resolver = {}
+
+--error handling -------------------------------------------------------------
+
+--errors raised with with check() and check_io() instead of assert() or error()
+--enable methods wrapped with protect() to catch those errors, free temporary
+--resources and return nil,err instead of raising. we thus distinguish between
+--invalid usage (bugs on this side, which raise), protocol errors (bugs on the
+--other side which don't raise but should be reported) and I/O errors (network
+--failures which can be temporary and thus make the call retriable).
+
+local dns_error  = errors.errortype'dns'
+local sock_error = errors.errortype'socket'
+
+local function check(self, v, ...)
+	if v then return v, ... end
+	local err, errcode = ...
+	errors.raise(dns_error{resolver = self, message = err, errorcode = errcode,
+		addtraceback = self.debug and self.debug.tracebacks})
 end
 
+local function check_io(self, v, ...)
+	if v then return v, ... end
+	local err, errcode = ...
+	errors.raise(sock_error{resolver = self, message = err, errorcode = errcode,
+		addtraceback = self.debug and self.debug.tracebacks})
+end
 
-local DOT_CHAR = byte(".")
-local ZERO_CHAR = byte("0")
-local COLON_CHAR = byte(":")
+local function close_all(self)
+	if self.udp_socket then self.udp_socket:close() ; self.udp_socket = nil end
+	if self.tcp_socket then self.tcp_socket:close(0); self.tcp_socket = nil end
+end
+dns_error .init = close_all
+sock_error.init = close_all
 
-local IP6_ARPA = "ip6.arpa"
+local function protect(self, method)
+	self[method] = errors.protect('dns socket', self[method])
+end
 
-local TYPE_A      = 1
-local TYPE_NS     = 2
-local TYPE_CNAME  = 5
-local TYPE_SOA    = 6
-local TYPE_PTR    = 12
-local TYPE_MX     = 15
-local TYPE_TXT    = 16
-local TYPE_AAAA   = 28
-local TYPE_SRV    = 33
-local TYPE_SPF    = 99
+--build request --------------------------------------------------------------
 
-local CLASS_IN    = 1
-
-local SECTION_AN  = 1
-local SECTION_NS  = 2
-local SECTION_AR  = 3
-
-
-local _M = {
-    _VERSION    = '0.21',
-    TYPE_A      = TYPE_A,
-    TYPE_NS     = TYPE_NS,
-    TYPE_CNAME  = TYPE_CNAME,
-    TYPE_SOA    = TYPE_SOA,
-    TYPE_PTR    = TYPE_PTR,
-    TYPE_MX     = TYPE_MX,
-    TYPE_TXT    = TYPE_TXT,
-    TYPE_AAAA   = TYPE_AAAA,
-    TYPE_SRV    = TYPE_SRV,
-    TYPE_SPF    = TYPE_SPF,
-    CLASS_IN    = CLASS_IN,
-    SECTION_AN  = SECTION_AN,
-    SECTION_NS  = SECTION_NS,
-    SECTION_AR  = SECTION_AR
+local qtypes = {
+	A      =  1,
+	NS     =  2,
+	CNAME  =  5,
+	SOA    =  6,
+	PTR    = 12,
+	MX     = 15,
+	TXT    = 16,
+	AAAA   = 28,
+	SRV    = 33,
+	SPF    = 99,
 }
 
+local function labels(s)
+	return char(#s)..s
+end
+local function names(s)
+	return s:gsub('([^.]+)%.?', labels)..'\0'
+end
+
+local function u16s(x)
+	return char(shr(x, 8), band(x, 0xff))
+end
+
+local function querys(qname, qtype) --query: name qtype(2) class(2)
+	assert(qname:sub(1, 1) ~= '.')
+	local qtype = qtypes[qtype] or tonumber(qtype)
+	return names(qname)..u16s(qtype)..u16s(1)
+end
+
+--NOTE: most DNS servers do not support multiple queries because it makes
+--them vulnerable to amplification attacks, so we don't implement it here.
+local function build_request(qname, qtype, no_recurse)
+	local id = math.random(0, 65535)
+	local flags = no_recurse and '\0\0' or '\1\0'
+	local qs = u16s(id)..flags..u16s(1)..'\0\0\0\0\0\0'..querys(qname, qtype)
+	return qs, id
+end
+
+--parse response -------------------------------------------------------------
+
+local function ip4(self, p, i, n) --ipv4 in binary
+	check(self, n >= i+4)
+	return format('%d.%d.%d.%d', p[i], p[i+1], p[i+2], p[i+3]), i+4
+end
+
+local function ip6(self, p, i, n) --ipv6 in binary
+	check(self, n >= i+16)
+	local t = {}
+	for i = 0, 15, 2 do
+		local a, b = p[i], p[i+1]
+		if a == 0 then
+			add(t, format('%x', b))
+		else
+			add(t, format('%x%02x', a, b))
+		end
+	end
+	return concat(t, ':'), i+16
+end
+
+local function u16(self, p, i, n) --u16 in big-endian
+	check(self, n >= i+2)
+	return shl(p[i], 8) + p[i+1], i+2
+end
+
+local function u32(self, p, i, n) --u32 in big-endian
+	check(self, n >= i+4)
+	return shl(p[i], 24) + shl(p[i+1], 16) + shl(p[i+2], 8) + p[i+3], i+4
+end
+
+local function label(self, p, i, n, maxlen) --string: len(1) text
+	check(self, n >= i+1)
+	local len = p[i]; i=i+1
+	check(self, len > 0 and len <= maxlen)
+	check(self, n >= i+len)
+	return ffi.string(p+i, len), i+len
+end
+
+local function name(self, p, i, n) --name: label1... end|pointer
+	local labels = {}
+	while true do
+		check(self, n >= i+1)
+		local len = p[i]; i=i+1
+		if len == 0 then --end: len(1) = 0
+			break
+		elseif band(len, 0xc0) ~= 0 then --pointer: offset(2) with b1100-0000-0000-0000 mask
+			check(self, n >= i+1)
+			local name_i = shl(band(len, 0x3f), 8) + p[i]; i=i+1
+			local suffix = name(self, p, name_i, n)
+			add(labels, suffix)
+			break
+		else --label: len(1) text
+			local s; s, i = label(self, p, i-1, n, 63)
+			add(labels, s)
+		end
+	end
+	local s = concat(labels, '.')
+	check(self, #s <= 253)
+	return s, i
+end
+
+local qtype_names = glue.index(qtypes)
+
+local function parse_answer(self, ans, p, i, n)
+	ans.name  , i = name(self, p, i, n)
+	local typ , i = u16(self, p, i, n)
+	ans.class , i = u16(self, p, i, n)
+	ans.ttl   , i = u32(self, p, i, n)
+	local len , i = u16(self, p, i, n)
+	typ = qtype_names[typ]
+	ans.type = typ
+	check(self, n >= i+len)
+	n = i+len
+	if typ == 'A' then
+		ans.a, i = ip4(self, p, i, n)
+	elseif typ == 'CNAME' then
+		ans.cname, i = name(self, p, i, n)
+	elseif typ == 'AAAA' then
+		ans.aaaa, i = ip6(self, p, i, n)
+	elseif typ == 'MX' then
+		ans.mx_priority , i = u16(self, p, i, n)
+		ans.mx          , i = name(self, p, i, n)
+	elseif typ == 'SRV' then
+		ans.srv_priority , i = u16(self, p, i, n)
+		ans.srv_weight   , i = u16(self, p, i, n)
+		ans.srv_port     , i = ua16(self, p, i, n)
+		ans.srv_target   , i = name(self, p, i, n)
+	elseif typ == 'NS' then
+		ans.ns, i = name(self, p, i, n)
+	elseif typ == 'TXT' or typ == 'SPF' then
+		local key = typ == 'TXT' and 'txt' or 'spf'
+		local s; s, i = label(self, p, i, n, 255)
+		if i < n then --more string fragments
+			local t = {s}
+			repeat
+				local s; s, i = label(self, p, i, n, 255)
+				add(t, s)
+			until i == n
+			s = concat(t)
+		end
+		ans[key] = s
+	elseif typ == 'PTR' then
+		ans.ptr, i = name(self, p, i, n)
+	elseif typ == 'SOA' then
+		ans.soa_mname     , i = name(self, p, i, n)
+		ans.soa_rname     , i = name(self, p, i, n)
+		ans.soa_serial    , i = u32(self, p, i, n)
+		ans.soa_refresh   , i = u32(self, p, i, n)
+		ans.soa_retry     , i = u32(self, p, i, n)
+		ans.soa_expire    , i = u32(self, p, i, n)
+		ans.soa_minimum   , i = u32(self, p, i, n)
+	else --unknown type, return the raw value
+		ans.rdata, i = ffi.string(p+i, n-i), n
+	end
+	return i
+end
+
+local function parse_section(self, answers, section, p, i, n, entries, should_skip)
+	for _ = 1, entries do
+		local ans = {section = section}
+		if not should_skip then
+			add(answers, ans)
+		end
+		i = parse_answer(self, ans, p, i, n)
+	end
+	return i
+end
 
 local resolver_errstrs = {
-    "format error",     -- 1
-    "server failure",   -- 2
-    "name error",       -- 3
-    "not implemented",  -- 4
-    "refused",          -- 5
+	'format error',     -- 1
+	'server failure',   -- 2
+	'name error',       -- 3
+	'not implemented',  -- 4
+	'refused',          -- 5
 }
 
-local soa_int32_fields = { "serial", "refresh", "retry", "expire", "minimum" }
+local function parse_response(self, p, n, qid, authority_section, additional_section)
 
-local mt = { __index = _M }
+	-- header layout: ident(2) flags(2) n1(2) n2(2) n3(2) n4(2)
+	local id    , i = u16(self, p, 0, n)
+	local flags , i = u16(self, p, i, n)
+	local n1    , i = u16(self, p, i, n) --number of questions
+	local n2    , i = u16(self, p, i, n) --number of answers
+	local n3    , i = u16(self, p, i, n) --number of authority entries
+	local n4    , i = u16(self, p, i, n) --number of additional entries
 
+	if id ~= qid then
+		return nil, 'id mismatch'
+	end
+	if band(flags, 0x200) ~= 0 then
+		return nil, 'truncated'
+	end
+	check(self, band(flags, 0x8000) ~= 0, 'bad QR flag')
 
-local arpa_tmpl = new_tab(72, 0)
+	--skip question section: (qname qtype(2) qclass(2)) ...
+	for _ = 1, n1 do
+		_, i = name(self, p, i, n) --qname
+		_, i = u16(self, p, i, n) --qtype
+		_, i = u16(self, p, i, n) --qclass
+	end
 
-for i = 1, #IP6_ARPA do
-    arpa_tmpl[64 + i] = byte(IP6_ARPA, i)
+	local answers = {}
+
+	local code = band(flags, 0xf)
+	if code ~= 0 then
+		answers.error = resolver_errstrs[code] or 'unknown'
+		answers.errorcode = code
+	end
+
+	authority_section = qtype == 'SOA' or authority_section
+
+	i = parse_section(self, answers, 'answer', p, i, n, n2)
+	if authority_section or additional_section then
+		i = parse_section(self, answers, 'authority', p, i, n, n3, not authority_section)
+		if additional_section then
+			i = parse_section(self, answers, 'additional', p, i, n, n4)
+		end
+	end
+
+	return answers
 end
 
-for i = 2, 64, 2 do
-    arpa_tmpl[i] = DOT_CHAR
+--dns client -----------------------------------------------------------------
+
+resolver.query_timeout = 2
+resolver.no_recurse = false
+resolver.authority_section = false
+resolver.additional_section = false
+
+local function tcp_query(self, host, port, expires, query, id)
+	local tcp = check_io(self, self.tcp())
+	self.tcp_socket = tcp
+	check_io(self, tcp:connect(host, port, expires))
+	check_io(self, tcp:sendall(u16s(#query) .. query), nil, expires)
+	check_io(self, tcp:recvall(buf, 2, expires))
+	local len = u16(self, buf, 0, 2)
+	check(self, len <= sz)
+	check_io(self, tcp:recvall(buf, len, expires))
+	close_all(self)
+	return parse_response(self, buf, len, id,
+		opt.authority_section, opt.additional_section)
 end
 
-function _M.udp() return require'socket'.udp() end
-function _M.tcp() return require'socket'.tcp() end
-function _M.udp_async() return require'socketloop'.wrap(_M.udp()) end
-function _M.tcp_async() return require'socketloop'.wrap(_M.tcp()) end
+function resolver:query(host, port, qname, qtype, opt)
+	port = port or 53
+	opt = opt and glue.object(self, opt) or self
+	local expires = self.clock() + opt.query_timeout
+	local query, id = build_request(qname, qtype or 'A', opt.no_recurse)
 
+	if #query > 512 or opt.tcp_only then
+		return tcp_query(self, host, port, expires, query, id)
+	end
 
-function _M.new(opts)
-    if not opts then
-        return nil, "no options table specified"
-    end
+	udp = check_io(self, self.udp())
+	self.udp_socket = udp
+	check_io(self, udp:connect(host, port))
+	check_io(self, udp:send(query, nil, expires))
 
-    local servers = opts.nameservers
-    if not servers or #servers == 0 then
-        return nil, "no nameservers specified"
-    end
+	--get & discard udp packets until we get the one with our id in it.
+	--if we get a truncated message, we try again on a one-shot TCP connection.
+	local sz = 4096
+	local buf = ffi.new('uint8_t[?]', sz)
+	for _ = 1, 128 do --ironically, this defeats the purpose of randomized ids.
+		local len = check_io(self, udp:recv(buf, sz, expires))
+		local answers, err = parse_response(self, buf, len, id,
+			opt.authority_section, opt.additional_section)
+		if answers then
+			close_all(self)
+			return answers
+		elseif err == 'truncated' then
+			close_all(self)
+			return tcp_query(self, host, port, expires, query, id, qn)
+		else
+			assert(err == 'id mismatch')
+		end
+	end
+	check(self, false, 'id mismatch')
+end
+protect(resolver, 'query')
 
-    local timeout = opts.timeout or 2000  -- default 2 sec
-
-    local n = #servers
-
-    local socks = {}
-
-    local udp = opts.udp or opts.async and _M.udp_async or _M.udp
-    local tcp = opts.tcp or opts.async and _M.tcp_async or _M.tcp
-
-    for i = 1, n do
-        local server = servers[i]
-        local sock, err = udp()
-        if not sock then
-            return nil, "failed to create udp socket: " .. err
-        end
-
-        local host, port
-        if type(server) == 'table' then
-            host = server[1]
-            port = server[2] or 53
-
-        else
-            host = server
-            port = 53
-            servers[i] = {host, port}
-        end
-
-        local ok, err = sock:setpeername(host, port)
-        if not ok then
-            return nil, "failed to set peer name: " .. err
-        end
-
-        sock:settimeout(timeout)
-
-        insert(socks, sock)
-    end
-
-    local tcp_sock, err = tcp()
-    if not tcp_sock then
-        return nil, "failed to create tcp socket: " .. err
-    end
-
-    tcp_sock:settimeout(timeout)
-
-    return setmetatable({
-        cur = rand(1, n),
-        socks = socks,
-        tcp_sock = tcp_sock,
-        servers = servers,
-        retrans = opts.retrans or 5,
-        no_recurse = opts.no_recurse,
-    }, mt)
+function resolver:bind_libs(libs)
+	for lib in libs:gmatch'[^%s]+' do
+		if lib == 'sock' then
+			local sock = require'sock'
+			self.tcp = sock.tcp
+			self.udp = sock.udp
+			self.addr = sock.addr
+			--scheduling
+			self.newthread = sock.newthread
+			self.resume = sock.resume
+			self.start = sock.start
+			self.clock = sock.clock
+		else
+			assert(false)
+		end
+	end
 end
 
+--name resolver --------------------------------------------------------------
 
-local function pick_sock(self, socks)
-    local cur = self.cur
+resolver.max_cache_entries = 1e5
 
-    if cur == #socks then
-        self.cur = 1
-    else
-        self.cur = cur + 1
-    end
-
-    return socks[cur]
+local function next_host(self)
+	self.host_index = (self.host_index % #self.host_ais) + 1
+	self.host_ai = self.host_ais[self.host_index]
 end
 
-
-local function _get_cur_server(self)
-    local cur = self.cur
-
-    local servers = self.servers
-
-    if cur == 1 then
-        return servers[#servers]
-    end
-
-    return servers[cur - 1]
+function resolver:new(opt)
+	local self = glue.update({}, self, opt)
+	if self.libs then
+		self:bind_libs(self.libs)
+	end
+	self.host_ais = {}
+	for i = 1, #self.hosts do
+		self.host_ais[i] = assert(self.addr(self.hosts[i], 53))
+		print(self.host_ais[i]:tostring())
+	end
+	self.host_index = 0
+	next_host(self)
+	self.cache = lrucache{max_size = self.max_cache_entries}
+	return self
 end
 
-
-function _M.set_timeout(self, timeout)
-    local socks = self.socks
-    if not socks then
-        return nil, "not initialized"
-    end
-
-    for i = 1, #socks do
-        local sock = socks[i]
-        sock:settimeout(timeout)
-    end
-
-    local tcp_sock = self.tcp_sock
-    if not tcp_sock then
-        return nil, "not initialized"
-    end
-
-    tcp_sock:settimeout(timeout)
+function resolver:lookup(name, qtype, maxtries)
+	qtype = qtype or 'A'
+	local key = qtype..' '..name
+	local res = self.cache:get(key)
+	if res and time() > res.expires then
+		self.cache:remove_val(res)
+		res = nil
+	end
+	if not res then
+		local err; res, err = self:query(self.host_ai, nil, name, qtype)
+		if not res then --change host and retry
+			print('error', err, self.host_ai:tostring(), name)
+			next_host(self)
+			return self:lookup(name, qtype, maxtries)
+		end
+		res.expires = 0
+		--TODO:
+		--res.expires = time() + res.ttl
+		self.cache:put(key, res)
+	end
+	return res
 end
 
-
-local function _encode_name(s)
-    return char(#s) .. s
+local function hex4(s)
+	return ('%04x'):format(tonumber(s, 16))
+end
+local function arpa_str(s)
+	if s:find(':', 1, true) then --ipv6
+		local _, n = s:gsub('[^:]+', hex4) --add leading zeroes and count blocks
+		if n < 8 then --decompress
+			local i = s:find('::', 1, true)
+			if i == 1 then
+				s = s:gsub('^::',      ('0000:'):rep(8 - n), 1)
+			elseif i == #s-1 then
+				s = s:gsub('::$',      (':0000'):rep(8 - n), 1)
+			else
+				s = s:gsub('::' , ':'..('0000:'):rep(8 - n), 1)
+			end
+		end
+		return (s:gsub(':', ''):reverse():gsub('.', '%0.')..'ip6.arpa')
+	else
+		return (s:gsub('^(%d+)%.(%d+)%.(%d+)%.(%d+)$', '%4.%3.%2.%1.in-addr.arpa'))
+	end
 end
 
-
-local function _decode_name(buf, pos)
-    local labels = {}
-    local nptrs = 0
-    local p = pos
-    while nptrs < 128 do
-        local fst = byte(buf, p)
-
-        if not fst then
-            return nil, 'truncated';
-        end
-
-        if fst == 0 then
-            if nptrs == 0 then
-                pos = pos + 1
-            end
-            break
-        end
-
-        if band(fst, 0xc0) ~= 0 then
-            -- being a pointer
-            if nptrs == 0 then
-                pos = pos + 2
-            end
-
-            nptrs = nptrs + 1
-
-            local snd = byte(buf, p + 1)
-            if not snd then
-                return nil, 'truncated'
-            end
-
-            p = lshift(band(fst, 0x3f), 8) + snd + 1
-
-        else
-            -- being a label
-            local label = sub(buf, p + 1, p + fst)
-            insert(labels, label)
-
-            p = p + fst + 1
-
-            if nptrs == 0 then
-                pos = p
-            end
-        end
-    end
-
-    return concat(labels, "."), pos
+function resolver:reverse_lookup(addr)
+	local s = arpa_str(addr)
+	if not s then return nil, 'invalid address' end
+	return self:lookup(s, 'PTR')
 end
-
-
-local function _build_request(qname, id, no_recurse, opts)
-    local qtype
-
-    if opts then
-        qtype = opts.qtype
-    end
-
-    if not qtype then
-        qtype = 1  -- A record
-    end
-
-    local ident_hi = char(rshift(id, 8))
-    local ident_lo = char(band(id, 0xff))
-
-    local flags
-    if no_recurse then
-        flags = "\0\0"
-    else
-        flags = "\1\0"
-    end
-
-    local nqs = "\0\1"
-    local nan = "\0\0"
-    local nns = "\0\0"
-    local nar = "\0\0"
-    local typ = char(rshift(qtype, 8), band(qtype, 0xff))
-    local class = "\0\1"    -- the Internet class
-
-    if byte(qname, 1) == DOT_CHAR then
-        return nil, "bad name"
-    end
-
-    local name = gsub(qname, "([^.]+)%.?", _encode_name) .. '\0'
-
-    return {
-        ident_hi, ident_lo, flags, nqs, nan, nns, nar,
-        name, typ, class
-    }
-end
-
-
-local function parse_section(answers, section, buf, start_pos, size,
-                             should_skip)
-    local pos = start_pos
-
-    for _ = 1, size do
-        local ans = {}
-
-        if not should_skip then
-            insert(answers, ans)
-        end
-
-        ans.section = section
-
-        local name
-        name, pos = _decode_name(buf, pos)
-        if not name then
-            return nil, pos
-        end
-
-        ans.name = name
-
-        local type_hi = byte(buf, pos)
-        local type_lo = byte(buf, pos + 1)
-        local typ = lshift(type_hi, 8) + type_lo
-
-        ans.type = typ
-
-        local class_hi = byte(buf, pos + 2)
-        local class_lo = byte(buf, pos + 3)
-        local class = lshift(class_hi, 8) + class_lo
-
-        ans.class = class
-
-        local byte_1, byte_2, byte_3, byte_4 = byte(buf, pos + 4, pos + 7)
-
-        local ttl = lshift(byte_1, 24) + lshift(byte_2, 16)
-                    + lshift(byte_3, 8) + byte_4
-
-        ans.ttl = ttl
-
-        local len_hi = byte(buf, pos + 8)
-        local len_lo = byte(buf, pos + 9)
-        local len = lshift(len_hi, 8) + len_lo
-
-        pos = pos + 10
-
-        if typ == TYPE_A then
-
-            if len ~= 4 then
-                return nil, "bad A record value length: " .. len
-            end
-
-            local addr_bytes = { byte(buf, pos, pos + 3) }
-            local addr = concat(addr_bytes, ".")
-
-            ans.address = addr
-
-            pos = pos + 4
-
-        elseif typ == TYPE_CNAME then
-
-            local cname, p = _decode_name(buf, pos)
-            if not cname then
-                return nil, pos
-            end
-
-            if p - pos ~= len then
-                return nil, format("bad cname record length: %d ~= %d",
-                                   p - pos, len)
-            end
-
-            pos = p
-
-            ans.cname = cname
-
-        elseif typ == TYPE_AAAA then
-
-            if len ~= 16 then
-                return nil, "bad AAAA record value length: " .. len
-            end
-
-            local addr_bytes = { byte(buf, pos, pos + 15) }
-            local flds = {}
-            for i = 1, 16, 2 do
-                local a = addr_bytes[i]
-                local b = addr_bytes[i + 1]
-                if a == 0 then
-                    insert(flds, format("%x", b))
-
-                else
-                    insert(flds, format("%x%02x", a, b))
-                end
-            end
-
-            -- we do not compress the IPv6 addresses by default
-            -- due to performance considerations.
-
-            ans.address = concat(flds, ":")
-
-            pos = pos + 16
-
-        elseif typ == TYPE_MX then
-
-            if len < 3 then
-                return nil, "bad MX record value length: " .. len
-            end
-
-            local pref_hi = byte(buf, pos)
-            local pref_lo = byte(buf, pos + 1)
-
-            ans.preference = lshift(pref_hi, 8) + pref_lo
-
-            local host, p = _decode_name(buf, pos + 2)
-            if not host then
-                return nil, pos
-            end
-
-            if p - pos ~= len then
-                return nil, format("bad cname record length: %d ~= %d",
-                                   p - pos, len)
-            end
-
-            ans.exchange = host
-
-            pos = p
-
-        elseif typ == TYPE_SRV then
-            if len < 7 then
-                return nil, "bad SRV record value length: " .. len
-            end
-
-            local prio_hi = byte(buf, pos)
-            local prio_lo = byte(buf, pos + 1)
-            ans.priority = lshift(prio_hi, 8) + prio_lo
-
-            local weight_hi = byte(buf, pos + 2)
-            local weight_lo = byte(buf, pos + 3)
-            ans.weight = lshift(weight_hi, 8) + weight_lo
-
-            local port_hi = byte(buf, pos + 4)
-            local port_lo = byte(buf, pos + 5)
-            ans.port = lshift(port_hi, 8) + port_lo
-
-            local name, p = _decode_name(buf, pos + 6)
-            if not name then
-                return nil, pos
-            end
-
-            if p - pos ~= len then
-                return nil, format("bad srv record length: %d ~= %d",
-                                   p - pos, len)
-            end
-
-            ans.target = name
-
-            pos = p
-
-        elseif typ == TYPE_NS then
-
-            local name, p = _decode_name(buf, pos)
-            if not name then
-                return nil, pos
-            end
-
-            if p - pos ~= len then
-                return nil, format("bad cname record length: %d ~= %d",
-                                   p - pos, len)
-            end
-
-            pos = p
-
-            ans.nsdname = name
-
-        elseif typ == TYPE_TXT or typ == TYPE_SPF then
-
-            local key = (typ == TYPE_TXT) and "txt" or "spf"
-
-            local slen = byte(buf, pos)
-            if slen + 1 > len then
-                -- truncate the over-run TXT record data
-                slen = len
-            end
-
-            local val = sub(buf, pos + 1, pos + slen)
-            local last = pos + len
-            pos = pos + slen + 1
-
-            if pos < last then
-                -- more strings to be processed
-                -- this code path is usually cold, so we do not
-                -- merge the following loop on this code path
-                -- with the processing logic above.
-
-                val = {val}
-                local idx = 2
-                repeat
-                    local slen = byte(buf, pos)
-                    if pos + slen + 1 > last then
-                        -- truncate the over-run TXT record data
-                        slen = last - pos - 1
-                    end
-
-                    val[idx] = sub(buf, pos + 1, pos + slen)
-                    idx = idx + 1
-                    pos = pos + slen + 1
-
-                until pos >= last
-            end
-
-            ans[key] = val
-
-        elseif typ == TYPE_PTR then
-
-            local name, p = _decode_name(buf, pos)
-            if not name then
-                return nil, pos
-            end
-
-            if p - pos ~= len then
-                return nil, format("bad cname record length: %d ~= %d",
-                                   p - pos, len)
-            end
-
-            pos = p
-
-            ans.ptrdname = name
-
-        elseif typ == TYPE_SOA then
-            local name, p = _decode_name(buf, pos)
-            if not name then
-                return nil, pos
-            end
-            ans.mname = name
-
-            pos = p
-            name, p = _decode_name(buf, pos)
-            if not name then
-                return nil, pos
-            end
-            ans.rname = name
-
-            for _, field in ipairs(soa_int32_fields) do
-                local byte_1, byte_2, byte_3, byte_4 = byte(buf, p, p + 3)
-                ans[field] = lshift(byte_1, 24) + lshift(byte_2, 16)
-                            + lshift(byte_3, 8) + byte_4
-                p = p + 4
-            end
-
-            pos = p
-
-        else
-            -- for unknown types, just forward the raw value
-
-            ans.rdata = sub(buf, pos, pos + len - 1)
-            pos = pos + len
-        end
-    end
-
-    return pos
-end
-
-
-local function parse_response(buf, id, opts)
-    local n = #buf
-    if n < 12 then
-        return nil, 'truncated';
-    end
-
-    -- header layout: ident flags nqs nan nns nar
-
-    local ident_hi = byte(buf, 1)
-    local ident_lo = byte(buf, 2)
-    local ans_id = lshift(ident_hi, 8) + ident_lo
-
-    if ans_id ~= id then
-        -- identifier mismatch and throw it away
-        return nil, "id mismatch in the DNS reply: " .. ans_id .. " ~= " .. id
-    end
-
-    local flags_hi = byte(buf, 3)
-    local flags_lo = byte(buf, 4)
-    local flags = lshift(flags_hi, 8) + flags_lo
-
-    if band(flags, 0x8000) == 0 then
-        return nil, format("bad QR flag in the DNS response")
-    end
-
-    if band(flags, 0x200) ~= 0 then
-        return nil, "truncated"
-    end
-
-    local code = band(flags, 0xf)
-
-    local nqs_hi = byte(buf, 5)
-    local nqs_lo = byte(buf, 6)
-    local nqs = lshift(nqs_hi, 8) + nqs_lo
-
-    if nqs ~= 1 then
-        return nil, format("bad number of questions in DNS response: %d", nqs)
-    end
-
-    local nan_hi = byte(buf, 7)
-    local nan_lo = byte(buf, 8)
-    local nan = lshift(nan_hi, 8) + nan_lo
-
-    local nns_hi = byte(buf, 9)
-    local nns_lo = byte(buf, 10)
-    local nns = lshift(nns_hi, 8) + nns_lo
-
-    local nar_hi = byte(buf, 11)
-    local nar_lo = byte(buf, 12)
-    local nar = lshift(nar_hi, 8) + nar_lo
-
-    -- skip the question part
-
-    local ans_qname, pos = _decode_name(buf, 13)
-    if not ans_qname then
-        return nil, pos
-    end
-
-    if pos + 3 + nan * 12 > n then
-        -- print(format("%d > %d", pos + 3 + nan * 12, n))
-        return nil, 'truncated';
-    end
-
-    -- question section layout: qname qtype(2) qclass(2)
-
-    local class_hi = byte(buf, pos + 2)
-    local class_lo = byte(buf, pos + 3)
-    local qclass = lshift(class_hi, 8) + class_lo
-
-    if qclass ~= 1 then
-        return nil, format("unknown query class %d in DNS response", qclass)
-    end
-
-    pos = pos + 4
-
-    local answers = {}
-
-    if code ~= 0 then
-        answers.errcode = code
-        answers.errstr = resolver_errstrs[code] or "unknown"
-    end
-
-    local authority_section, additional_section
-
-    if opts then
-        authority_section = opts.authority_section
-        additional_section = opts.additional_section
-        if opts.qtype == TYPE_SOA then
-            authority_section = true
-        end
-    end
-
-    local err
-
-    pos, err = parse_section(answers, SECTION_AN, buf, pos, nan)
-
-    if not pos then
-        return nil, err
-    end
-
-    if not authority_section and not additional_section then
-        return answers
-    end
-
-    pos, err = parse_section(answers, SECTION_NS, buf, pos, nns,
-                             not authority_section)
-
-    if not pos then
-        return nil, err
-    end
-
-    if not additional_section then
-        return answers
-    end
-
-    pos, err = parse_section(answers, SECTION_AR, buf, pos, nar)
-
-    if not pos then
-        return nil, err
-    end
-
-    return answers
-end
-
-
-local function _gen_id(self)
-    local id = self._id   -- for regression testing
-    if id then
-        return id
-    end
-    return rand(0, 65535)   -- two bytes
-end
-
-
-local function _tcp_query(self, query, id, opts)
-    local sock = self.tcp_sock
-    if not sock then
-        return nil, "not initialized"
-    end
-
-    local server = _get_cur_server(self)
-
-    local ok, err = sock:connect(server[1], server[2])
-    if not ok then
-        return nil, "failed to connect to TCP server "
-            .. concat(server, ":") .. ": " .. err
-    end
-
-    query = concat(query, "")
-    local len = #query
-
-    local len_hi = char(rshift(len, 8))
-    local len_lo = char(band(len, 0xff))
-
-    local bytes, err = sock:send(table.concat{len_hi, len_lo, query})
-    if not bytes then
-        return nil, "failed to send query to TCP server "
-            .. concat(server, ":") .. ": " .. err
-    end
-
-    local buf, err = sock:receive(2)
-    if not buf then
-        return nil, "failed to receive the reply length field from TCP server "
-            .. concat(server, ":") .. ": " .. err
-    end
-
-    len_hi = byte(buf, 1)
-    len_lo = byte(buf, 2)
-    len = lshift(len_hi, 8) + len_lo
-
-    buf, err = sock:receive(len)
-    if not buf then
-        return nil, "failed to receive the reply message body from TCP server "
-            .. concat(server, ":") .. ": " .. err
-    end
-
-    local answers, err = parse_response(buf, id, opts)
-    if not answers then
-        return nil, "failed to parse the reply from the TCP server "
-            .. concat(server, ":") .. ": " .. err
-    end
-
-    sock:close()
-
-    return answers
-end
-
-
-function _M.tcp_query(self, qname, opts)
-    local socks = self.socks
-    if not socks then
-        return nil, "not initialized"
-    end
-
-    pick_sock(self, socks)
-
-    local id = _gen_id(self)
-
-    local query, err = _build_request(qname, id, self.no_recurse, opts)
-    if not query then
-        return nil, err
-    end
-
-    return _tcp_query(self, query, id, opts)
-end
-
-
-function _M.query(self, qname, opts, tries)
-    local socks = self.socks
-    if not socks then
-        return nil, "not initialized"
-    end
-
-    local id = _gen_id(self)
-
-    local query, err = _build_request(qname, id, self.no_recurse, opts)
-    if not query then
-        return nil, err
-    end
-
-    local retrans = self.retrans
-    if tries then
-        tries[1] = nil
-    end
-
-    for i = 1, retrans do
-        local sock = pick_sock(self, socks)
-
-        local ok
-        ok, err = sock:send(table.concat(query))
-        if not ok then
-            local server = _get_cur_server(self)
-            err = "failed to send request to UDP server "
-                .. concat(server, ":") .. ": " .. err
-
-        else
-            local buf
-
-            for _ = 1, 128 do
-                buf, err = sock:receive(4096)
-                if err then
-                    local server = _get_cur_server(self)
-                    err = "failed to receive reply from UDP server "
-                        .. concat(server, ":") .. ": " .. err
-                    break
-                end
-
-                if buf then
-                    local answers
-                    answers, err = parse_response(buf, id, opts)
-                    if err == "truncated" then
-                        answers, err = _tcp_query(self, query, id, opts)
-                    end
-
-                    if err and err ~= "id mismatch" then
-                        break
-                    end
-
-                    if answers then
-                        return answers, nil, tries
-                    end
-                end
-                -- only here in case of an "id mismatch"
-            end
-        end
-
-        if tries then
-            tries[i] = err
-            tries[i + 1] = nil -- ensure termination for user supplied table
-        end
-    end
-
-    return nil, err, tries
-end
-
-
-function _M.arpa_str(addr)
-    if find(addr, ":", 1, true) then
-        local idx, hidx, addrlen = 1, 1, #addr
-
-        for i = addrlen, 0, -1 do
-            local s = byte(addr, i)
-            if s == COLON_CHAR or not s then
-                for _ = hidx, 4 do
-                    arpa_tmpl[idx] = ZERO_CHAR
-                    idx = idx + 2
-                end
-                hidx = 1
-            else
-                arpa_tmpl[idx] = s
-                idx = idx + 2
-                hidx = hidx + 1
-            end
-        end
-
-        addr = char(unpack(arpa_tmpl))
-    else
-        addr = addr:gsub('^(%d+)%.(%d+)%.(%d+)%.(%d+)$', '%4.%3.%2.%1.in-addr.arpa')
-    end
-
-    return addr
-end
-
-
-function _M.reverse_query(self, addr)
-    return self.query(self, self.arpa_str(addr),
-                      {qtype = self.TYPE_PTR})
-end
-
 
 --self-test ------------------------------------------------------------------
 
 if not ... then
 
-    local resolver = _M
+	local r = assert(resolver:new{
+		libs = 'sock',
+		hosts = {
+			'8.8.8.8',
+			--{host = '8.8.4.4', port = 53},
+		},
+		query_timeout = 20,
+		--tcp_only = true,
+	})
 
-    local function resolve(hostname)
-        local r, err = assert(resolver.new{
-           nameservers = {'8.8.8.8', {'8.8.4.4', 53} },
-           retrans = 5,  -- 5 retransmissions on receive timeout
-           timeout = 2000,  -- 2 sec
-           async = true,
-        })
-        local answers, err, tries = r:query(hostname, nil, {}, {})
-        if not answers then
-            print('failed to query the DNS server: ' .. err)
-            print('retries: ' .. table.concat(tries, '\n'))
-        elseif answers.errcode then
-            print('server returned error code: ' ..
-              answers.errcode .. ': ' .. answers.errstr)
-        end
-        for i, ans in ipairs(answers) do
-            print(string.format('%-16s %-16s type: %d  class %d  ttl: %3d  retries: %d',
-                ans.name,
-                ans.address or ans.cname,
-                ans.type,
-                ans.class,
-                ans.ttl,
-                #tries))
-        end
-    end
-
-    local loop = require'socketloop'
-    for _,s in ipairs{
-        'www.google.com',
-        'luapower.com',
-        'lua.org',
-        'openresty.org',
-    } do
-        loop.newthread(resolve, s)
-    end
-    loop.start()
+	local function lookup(hostname)
+		local answers, err = r:lookup(hostname)
+		if answers.error then
+			print(format('%s [%d]', answers.error, answers.errorcode))
+		end
+		for i, ans in ipairs(answers) do
+			print(format('%-16s %-16s type: %s  ttl: %3d',
+				ans.name,
+				ans.a or ans.cname,
+				ans.type,
+				ans.ttl))
+		end
+	end
+	for _,s in ipairs{
+		'luapower.com',
+		'openresty.org',
+		'www.google.com',
+		'lua.org',
+	} do
+		r.resume(r.newthread(lookup), s)
+	end
+	r.start()
 
 end
 
-return _M
+
+return resolver
