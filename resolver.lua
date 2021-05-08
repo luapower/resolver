@@ -341,24 +341,30 @@ local DEBUG = true
 
 local coro = DEBUG and require'coro'
 
-local function dbg(ns, q, ...)
-	print(coro.name(),
+local function _dbg(ns, q, ...)
+	print(
+		'resolver.lua:'..debug.getinfo(3).currentline..':',
+		coro.name(),
 		ns and glue.count(ns.queue) or '',
 		q and q.name:sub(1, 7) or '',
 		q and q.i or '',
 		...)
 end
 
+local function dbg(ns, q, ...)
+	_dbg(ns, q, ...)
+end
+
 local function dbgr(ns, q, t, ...)
-	dbg(ns, q, '->', coro.name(t), ...)
+	_dbg(ns, q, '=>', coro.name(t), ...)
 end
 
 local function dbgt(ns, q, ...)
-	dbgr(ns, q, q.thread, ...)
+	_dbg(ns, q, '->', coro.name(q.thread), ...)
 end
 
 local function dbgs(ns, q, ...)
-	dbg(ns, q, '.', ...)
+	_dbg(ns, q, '.', ...)
 end
 
 if not DEBUG then
@@ -378,6 +384,8 @@ query.tcp_only = false
 
 --NOTE: DNS servers don't support request pipelining so we use one-shot sockets.
 local function tcp_query(rs, ns, q)
+
+	dbg(ns, q, 'TCP_QUERY')
 
 	local tcp = check_io(q, rs.tcp())
 	q.tcp = tcp --pin it so that it's closed automatically on error.
@@ -458,15 +466,10 @@ local function do_query(rs, ns, q)
 	dbgs(ns, q)
 	local buf, len = check_io(q, rs.suspend())
 
-	--parse the reply.
 	local answers, err = parse_response(q, buf, len)
 
 	if not answers and err == 'truncated' then
 		answers, err = tcp_query(rs, ns, q)
-	end
-
-	if answers then
-		q.thread = nil --hide this thread to discard late replies.
 	end
 
 	--before returning, we have to resume the scheduler again.
@@ -475,6 +478,7 @@ local function do_query(rs, ns, q)
 
 	return answers, err
 end
+local do_query = protect(do_query)
 
 local function schedule(rs, ns)
 	local sz = 4096
@@ -520,20 +524,12 @@ local function schedule(rs, ns)
 			if q then
 				if rs.clock() < q.expires then
 					ns.queue[qid] = nil
-					if q.thread then
-						dbgt(ns, q, 'DATA', len)
-						rs.transfer(q.thread, buf, len)
-					else
-						dbg(ns, q, 'DISCARD')
-					end
+					dbgt(ns, q, 'DATA', len)
+					rs.transfer(q.thread, buf, len)
 				else
 					q.lost = true
-					if q.thread then
-						dbgt(ns, q, 'TIMEOUT')
-						rs.transfer(q.thread, nil, 'timeout')
-					else
- 						dbg(ns, q, 'DISCARD')
-					end
+					dbgt(ns, q, 'TIMEOUT')
+					rs.transfer(q.thread, nil, 'timeout')
 				end
 			else
 				dbg(ns, nil, '???', qid)
@@ -618,14 +614,26 @@ local function lookup(rs, qname, qtype)
 	if res then
 		return res
 	end
-	local q = glue.object(query, glue.update({name = qname, type = qtype}, t))
 	local lookup_thread = rs.currentthread()
+	local queries_left = #rs.nst
 	for i,ns in ipairs(rs.nst) do
 		rs.resume(rs.newthread(function()
+			local q = glue.object(query, glue.update({name = qname, type = qtype}, t))
 			local res, err = do_query(rs, ns, q) --suspends inside the first send().
+			queries_left = queries_left - 1
+			if not lookup_thread then
+				dbg(ns, q, 'DISCARD (late)')
+				return
+			end
+			if not res and errors.is(err, 'socket') and queries_left > 0 then
+				dbg(ns, q, 'DISCARD (socket error and not last)')
+				return
+			end
+			local lt = lookup_thread
+			lookup_thread = nil
 			if not res then
-				dbgr(ns, q, lookup_thread, nil, err)
-				rs.resume(lookup_thread, nil, err)
+				dbgr(ns, q, lt, nil, err)
+				rs.resume(lt, nil, err)
 			else
 				local min_ttl = 1/0
 				for _,answer in ipairs(res) do
@@ -633,8 +641,8 @@ local function lookup(rs, qname, qtype)
 				end
 				res.expires = time() + min_ttl
 				rs.cache:put(key, res)
-				dbgr(ns, q, lookup_thread, '{...}')
-				rs.resume(lookup_thread, res)
+				dbgr(ns, q, lt, '{...}')
+				rs.resume(lt, res)
 			end
 		end, DEBUG and 'N'..i..'-'..coro.name()))
 	end
@@ -680,6 +688,8 @@ if not ... then
 	local r = assert(resolver:new{
 		libs = 'sock',
 		nameservers = {
+			--'127.0.0.1', --TODO
+			'10.0.0.1',
 			'10.0.0.10',
 			'1.1.1.1',
 			--'8.8.8.8',
