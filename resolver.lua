@@ -504,7 +504,8 @@ local function schedule(rs, ns)
 				end
 			end
 			dbg(ns, nil, 'RECV.',
-				min_expires and string.format('%.2f', min_expires - now) or 'ALL EXPIRED')
+				DEBUG and min_expires and string.format('%.2f', min_expires - now)
+					or 'ALL EXPIRED')
 			if not min_expires then
 				break
 			end
@@ -588,7 +589,7 @@ local function create_resolver(rs, opt)
 		end, 'N'..i)
 		rs.nst[i] = ns
 		ns.i = i
-		print(ai:tostring())
+		dbg(ns, nil, 'NS', DEBUG and ai:tostring())
 	end
 
 	rs.cache = lrucache{max_size = rs.max_cache_entries}
