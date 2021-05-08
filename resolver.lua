@@ -19,8 +19,6 @@ local format = string.format
 local add = table.insert
 local concat = table.concat
 
-local resolver = {}
-
 --error handling -------------------------------------------------------------
 
 --[[
@@ -283,10 +281,7 @@ local function parse_response(q, p, n)
 	local answers = {}
 
 	local code = band(flags, 0xf)
-	if code ~= 0 then
-		answers.error = resolver_err_strs[code] or 'unknown'
-		answers.errorcode = code
-	end
+	check(q, code == 0, resolver_err_strs[code] or 'unknown', code)
 
 	local additional_section = q.additional_section
 	local authority_section = q.type == 'SOA' or q.authority_section
@@ -373,6 +368,11 @@ end
 
 --end debugging --------------------------------------------------------------
 
+local resolver = {}
+
+resolver.libs = 'sock'
+resolver.max_cache_entries = 1e5
+
 local query = {}
 
 query.timeout = 5
@@ -393,7 +393,7 @@ local function tcp_query(rs, ns, q)
 	local expires = q.expires
 
 	check_io(q, tcp:connect(ns.ai, nil, expires))
-	check_io(q, tcp:sendall(u16_str(#q.s) .. q.s), nil, expires)
+	check_io(q, tcp:sendall(u16_str(#q.s) .. q.s, nil, expires))
 
 	local len_buf = ffi.new'uint8_t[2]'
 	check_io(q, tcp:recvall(len_buf, 2, expires))
@@ -426,7 +426,7 @@ end
 
 local qi = 0
 
-local function do_query(rs, ns, q)
+local function ns_query(rs, ns, q)
 
 	assert(q.timeout >= 0.1)
 
@@ -466,19 +466,19 @@ local function do_query(rs, ns, q)
 	dbgs(ns, q)
 	local buf, len = check_io(q, rs.suspend())
 
-	local answers, err = parse_response(q, buf, len)
+	local answers, err, errcode = parse_response(q, buf, len)
 
 	if not answers and err == 'truncated' then
-		answers, err = tcp_query(rs, ns, q)
+		answers, err, errcode = tcp_query(rs, ns, q)
 	end
 
 	--before returning, we have to resume the scheduler again.
 	dbgr(ns, q, ns.scheduler)
 	rs.resume(ns.scheduler)
 
-	return answers, err
+	return answers, err, errcode
 end
-local do_query = protect(do_query)
+local ns_query = protect(ns_query)
 
 local function schedule(rs, ns)
 	local sz = 4096
@@ -541,8 +541,6 @@ local function schedule(rs, ns)
 	end
 end
 
-resolver.max_cache_entries = 1e5
-
 local function bind_libs(self, libs)
 	for lib in libs:gmatch'[^%s]+' do
 		if lib == 'sock' then
@@ -599,10 +597,10 @@ local function create_resolver(rs, opt)
 end
 resolver.new = create_resolver
 
-local function lookup(rs, qname, qtype)
+local function rs_query(rs, qname, qtype, timeout)
 	local t = type(qname) == 'table' and qname or nil
 	if t then
-		qname, qtype = t.name, t.type
+		qname, qtype, timeout = t.name, t.type, t.timeout
 	end
 	qtype = qtype or 'A'
 	local key = qtype..' '..qname
@@ -618,8 +616,9 @@ local function lookup(rs, qname, qtype)
 	local queries_left = #rs.nst
 	for i,ns in ipairs(rs.nst) do
 		rs.resume(rs.newthread(function()
-			local q = glue.object(query, glue.update({name = qname, type = qtype}, t))
-			local res, err = do_query(rs, ns, q) --suspends inside the first send().
+			local q = {name = qname, type = qtype, timeout = timeout}
+			local q = glue.object(query, glue.update(q, t))
+			local res, err, errcode = ns_query(rs, ns, q) --suspends inside the first send().
 			queries_left = queries_left - 1
 			if not lookup_thread then
 				dbg(ns, q, 'DISCARD (late)')
@@ -632,8 +631,8 @@ local function lookup(rs, qname, qtype)
 			local lt = lookup_thread
 			lookup_thread = nil
 			if not res then
-				dbgr(ns, q, lt, nil, err)
-				rs.resume(lt, nil, err)
+				dbgr(ns, q, lt, nil, err, errcode)
+				rs.resume(lt, nil, err, errcode)
 			else
 				local min_ttl = 1/0
 				for _,answer in ipairs(res) do
@@ -649,7 +648,7 @@ local function lookup(rs, qname, qtype)
 	dbgs()
 	return rs.suspend() -- the first thread to finish will resume us.
 end
-resolver.lookup = protect(lookup)
+resolver.query = protect(rs_query)
 
 local function hex4(s)
 	return ('%04x'):format(tonumber(s, 16))
@@ -673,10 +672,26 @@ local function arpa_str(s)
 	end
 end
 
-function resolver:reverse_lookup(addr)
+local function filter_answers(type, key, ret, ...)
+	if not ret then return ret, ... end
+	local t = {}
+	for i,ans in ipairs(ret) do
+		if ans.type == type then
+			table.insert(t, ans[key])
+		end
+	end
+	return t
+end
+
+function resolver:lookup(name, type, timeout)
+	type = type or 'A'
+	return filter_answers(type, type:lower(), self:query(name, type, timeout))
+end
+
+function resolver:reverse_lookup(addr, timeout)
 	local s = arpa_str(addr)
 	if not s then return nil, 'invalid address' end
-	return self:lookup(s, 'PTR')
+	return filter_answers('PTR', 'ptr', self:query(s, 'PTR', timeout))
 end
 
 --self-test ------------------------------------------------------------------
@@ -686,47 +701,60 @@ if not ... then
 	math.randomseed(clock())
 
 	local r = assert(resolver:new{
-		libs = 'sock',
 		nameservers = {
 			--'127.0.0.1', --TODO
 			'10.0.0.1',
-			'10.0.0.10',
-			'1.1.1.1',
+			--'10.0.0.10',
+			--'1.1.1.1',
 			--'8.8.8.8',
 			--{host = '8.8.4.4', port = 53},
 		},
-		--tcp_only = true,
+		tcp_only = true,
 	})
 
 	local function lookup(q)
+
 		dbg(nil, type(q) == 'string' and {name = q} or q, 'LOOKUP')
 		local s = type(q) == 'string' and q or pp.format(q)
-		local answers, err = r:lookup(q)
+
+		local answers, err, errcode = r:query(q)
+
 		if not answers then
-			print(format('%s: %s', s, err))
-		elseif answers.error then
-			print(format('%s: %s [%d]', s, answers.error, answers.errorcode))
+			print(format('%s: %s [%s]', s, err, errcode))
 		else
 			for i, ans in ipairs(answers) do
+
 				print(format('%-16s %-16s type: %s  ttl: %3d',
 					ans.name,
 					ans.a or ans.cname,
 					ans.type,
 					ans.ttl))
+
+				if ans.a then
+					local names, err, errcode = r:reverse_lookup(ans.a)
+					if not names then
+						print(format('%s: %s [%s]', s, err, errcode))
+					else
+						for i,name in ipairs(names) do
+							print('', ans.a, name)
+						end
+					end
+				end
 			end
 		end
 	end
+
 	for i,s in ipairs{
-		{name = 'luapower.com', tcp_only = false, timeout = 1},
-		{name = 'catcostaocasa.ro', timeout = 1},
-		'www.yahoo.com',
-		'www.openresty.org',
-		'www.lua.org',
+		--{name = 'luapower.com', tcp_only = false, timeout = 1},
+		--{name = 'catcostaocasa.ro', timeout = 1},
+		{name = 'www.yahoo.com', timeout = 1},
+ 		--'www.openresty.org',
+		--'www.lua.org',
 	} do
 		r.resume(r.newthread(lookup, 'L'..i), s)
 	end
-	r.start()
 
+	r.start()
 end
 
 
