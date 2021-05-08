@@ -330,62 +330,50 @@ always the I/O scheduler. With more complex schemes the answer is up to you.
 
 ]]
 
---debugging ------------------------------------------------------------------
+local rs = {} --resolver class
 
-local DEBUG = true
+rs.libs = 'sock'
+rs.max_cache_entries = 1e5
 
-local coro = DEBUG and require'coro'
-
-local function _dbg(ns, q, ...)
+function rs:_dbg(ns, q, ...)
 	print(
 		'resolver.lua:'..debug.getinfo(3).currentline..':',
-		coro.name(),
+		require'coro'.name(),
 		ns and glue.count(ns.queue) or '',
 		q and q.name:sub(1, 7) or '',
 		q and q.i or '',
 		...)
 end
 
-local function dbg(ns, q, ...)
-	_dbg(ns, q, ...)
+function rs:dbg(ns, q, ...)
+	self:_dbg(ns, q, ...)
 end
 
-local function dbgr(ns, q, t, ...)
-	_dbg(ns, q, '=>', coro.name(t), ...)
+function rs:dbgr(ns, q, t, ...)
+	self:_dbg(ns, q, '=>', require'coro'.name(t), ...)
 end
 
-local function dbgt(ns, q, ...)
-	_dbg(ns, q, '->', coro.name(q.thread), ...)
+function rs:dbgt(ns, q, ...)
+	self:_dbg(ns, q, '->', require'coro'.name(q.thread), ...)
 end
 
-local function dbgs(ns, q, ...)
-	_dbg(ns, q, '.', ...)
+function rs:dbgs(ns, q, ...)
+	self:_dbg(ns, q, '.', ...)
 end
 
-if not DEBUG then
-	dbg, dbgr, dbgt, dbgs = glue.noop, glue.noop, glue.noop, glue.noop
-end
+local q = {} --query class
 
---end debugging --------------------------------------------------------------
-
-local resolver = {}
-
-resolver.libs = 'sock'
-resolver.max_cache_entries = 1e5
-
-local query = {}
-
-query.timeout = 5
-query.recurse = true
-query.authority_section = false
-query.additional_section = false
-query.tracebacks = false
-query.tcp_only = false
+q.timeout = 5
+q.recurse = true
+q.authority_section = false
+q.additional_section = false
+q.tracebacks = false
+q.tcp_only = false
 
 --NOTE: DNS servers don't support request pipelining so we use one-shot sockets.
 local function tcp_query(rs, ns, q)
 
-	dbg(ns, q, 'TCP_QUERY')
+	rs:dbg(ns, q, 'TCP_QUERY')
 
 	local tcp = check_io(q, rs.tcp())
 	q.tcp = tcp --pin it so that it's closed automatically on error.
@@ -409,14 +397,14 @@ local function tcp_query(rs, ns, q)
 	return parse_response(q, buf, len)
 end
 
-local function gen_qid(ns, now)
+local function gen_qid(rs, ns, now)
 	for i = 1, 10 do --expect a 50% chance of collision at around 362 qids.
 		local qid = math.random(0, 65535)
 		local q = ns.queue[qid]
 		if not q then
 			return qid
 		elseif q.lost and now > q.expires + 120 then --safe to reuse this id.
-			dbg(ns, q, 'REUSE')
+			rs:dbg(ns, q, 'REUSE')
 			ns.queue[qid] = nil
 			return qid
 		end
@@ -433,7 +421,7 @@ local function ns_query(rs, ns, q)
 	--generate a request with a random id.
 	local now = rs.clock()
 	q.expires = now + q.timeout
-	q.id = check_io(q, gen_qid(ns, now))
+	q.id = check_io(q, gen_qid(rs, ns, now))
 	qi = qi + 1
 	q.i = qi
 	q.s = request_str(q)
@@ -450,21 +438,24 @@ local function ns_query(rs, ns, q)
 	--send the request. being run with resume(), this thread will now suspend
 	--itself inside send(), returning control to the calling thread.
 	--the I/O scheduler is then responsible for resuming this thread.
-	dbg(ns, q, 'SEND.')
+	rs:dbg(ns, q, 'SEND.')
 	check_io(q, ns.udp:send(q.s, nil, q.expires))
-	dbg(ns, q, 'SENT')
+	rs:dbg(ns, q, 'SENT')
 
 	--resume the scheduler if it's idle. being called with resume(), it will
 	--suspend itself inside the first recv() call and transfer back to us.
 	if not ns.scheduler_running then
-		dbgr(ns, q, ns.scheduler)
-		rs.resume(ns.scheduler)
+		rs:dbgr(ns, q, ns.scheduler)
+		print(rs.resume(ns.scheduler))
 	end
 
 	--suspend. the scheduler will transfer to us on the matching recv()
 	--with the return values of that recv().
-	dbgs(ns, q)
-	local buf, len = check_io(q, rs.suspend())
+	rs:dbgs(ns, q)
+	local buf, len, errcode = check_io(q, rs.suspend())
+	if not buf then
+		return nil, len, errcode
+	end
 
 	local answers, err, errcode = parse_response(q, buf, len)
 
@@ -473,7 +464,7 @@ local function ns_query(rs, ns, q)
 	end
 
 	--before returning, we have to resume the scheduler again.
-	dbgr(ns, q, ns.scheduler)
+	rs:dbgr(ns, q, ns.scheduler)
 	rs.resume(ns.scheduler)
 
 	return answers, err, errcode
@@ -486,7 +477,6 @@ local function schedule(rs, ns)
 	while true do
 		ns.scheduler_running = true
 		while true do
-			--dbg(ns, nil, '!')
 			local min_expires
 			local now = rs.clock()
 			for qid, q in pairs(ns.queue) do
@@ -495,28 +485,28 @@ local function schedule(rs, ns)
 						min_expires = math.min(min_expires or 1/0, q.expires)
 					else
 						q.lost = true
-						dbgt(ns, q, 'TIMEOUT')
+						rs:dbgt(ns, q, 'TIMEOUT')
 						rs.transfer(q.thread, nil, 'timeout')
 					end
 				elseif now > q.expires + 120 then --safe to reuse this id.
-					dbg(ns, q, 'REUSE')
+					rs:dbg(ns, q, 'REUSE')
 					ns.queue[qid] = nil
 				end
 			end
-			dbg(ns, nil, 'RECV.',
+			rs:dbg(ns, nil, 'RECV.',
 				DEBUG and min_expires and string.format('%.2f', min_expires - now)
 					or 'ALL EXPIRED')
 			if not min_expires then
 				break
 			end
-			local len, err = ns.udp:recv(buf, sz, min_expires)
-			dbg(ns, nil, 'RECV', len, err or '')
+			local len, err, errcode = ns.udp:recv(buf, sz, min_expires)
+			rs:dbg(ns, nil, 'RECV', len, err or '', errcode or '')
 			if not len then
 				for qid, q in pairs(ns.queue) do
 					if not q.lost then
 						q.lost = true
-						dbgt(ns, q, 'ERROR', err)
-						rs.transfer(q.thread, nil, err)
+						rs:dbgt(ns, q, 'ERROR', err, errcode)
+						rs.transfer(q.thread, nil, err, errcode)
 					end
 				end
 			end
@@ -525,19 +515,19 @@ local function schedule(rs, ns)
 			if q then
 				if rs.clock() < q.expires then
 					ns.queue[qid] = nil
-					dbgt(ns, q, 'DATA', len)
+					rs:dbgt(ns, q, 'DATA', len)
 					rs.transfer(q.thread, buf, len)
 				else
 					q.lost = true
-					dbgt(ns, q, 'TIMEOUT')
+					rs:dbgt(ns, q, 'TIMEOUT')
 					rs.transfer(q.thread, nil, 'timeout')
 				end
 			else
-				dbg(ns, nil, '???', qid)
+				rs:dbg(ns, nil, '???', qid)
 			end
 		end
 		ns.scheduler_running = false
-		dbgs()
+		rs:dbgs()
 		rs.suspend()
 	end
 end
@@ -566,6 +556,13 @@ end
 local function create_resolver(rs, opt)
 	local rs = glue.update({}, rs, opt)
 
+	if not rs.debug then
+		rs.dbg  = glue.noop
+		rs.dbgt = glue.noop
+		rs.dbgs = glue.noop
+		rs.dbgr = glue.noop
+	end
+
 	if rs.libs then
 		bind_libs(rs, rs.libs)
 	end
@@ -589,14 +586,14 @@ local function create_resolver(rs, opt)
 		end, 'N'..i)
 		rs.nst[i] = ns
 		ns.i = i
-		dbg(ns, nil, 'NS', DEBUG and ai:tostring())
+		rs:dbg(ns, nil, 'NS', DEBUG and ai:tostring())
 	end
 
 	rs.cache = lrucache{max_size = rs.max_cache_entries}
 
 	return rs
 end
-resolver.new = create_resolver
+rs.new = create_resolver
 
 local function rs_query(rs, qname, qtype, timeout)
 	local t = type(qname) == 'table' and qname or nil
@@ -604,6 +601,7 @@ local function rs_query(rs, qname, qtype, timeout)
 		qname, qtype, timeout = t.name, t.type, t.timeout
 	end
 	qtype = qtype or 'A'
+	rs:dbg(nil, {name = qname}, 'LOOKUP')
 	local key = qtype..' '..qname
 	local res = rs.cache:get(key)
 	if res and time() > res.expires then
@@ -617,22 +615,22 @@ local function rs_query(rs, qname, qtype, timeout)
 	local queries_left = #rs.nst
 	for i,ns in ipairs(rs.nst) do
 		rs.resume(rs.newthread(function()
-			local q = {name = qname, type = qtype, timeout = timeout}
-			local q = glue.object(query, glue.update(q, t))
+			local t = glue.update({name = qname, type = qtype, timeout = timeout}, t)
+			local q = glue.object(q, t)
 			local res, err, errcode = ns_query(rs, ns, q) --suspends inside the first send().
 			queries_left = queries_left - 1
 			if not lookup_thread then
-				dbg(ns, q, 'DISCARD (late)')
+				rs:dbg(ns, q, 'DISCARD (late)')
 				return
 			end
 			if not res and errors.is(err, 'socket') and queries_left > 0 then
-				dbg(ns, q, 'DISCARD (socket error and not last)')
+				rs:dbg(ns, q, 'DISCARD (socket error and not last)')
 				return
 			end
 			local lt = lookup_thread
 			lookup_thread = nil
 			if not res then
-				dbgr(ns, q, lt, nil, err, errcode)
+				rs:dbgr(ns, q, lt, nil, err, errcode)
 				rs.resume(lt, nil, err, errcode)
 			else
 				local min_ttl = 1/0
@@ -641,15 +639,15 @@ local function rs_query(rs, qname, qtype, timeout)
 				end
 				res.expires = time() + min_ttl
 				rs.cache:put(key, res)
-				dbgr(ns, q, lt, '{...}')
+				rs:dbgr(ns, q, lt, '{...}')
 				rs.resume(lt, res)
 			end
-		end, DEBUG and 'N'..i..'-'..coro.name()))
+		end, rs.debug and 'N'..i..'-'..require'coro'.name()))
 	end
-	dbgs()
+	rs:dbgs()
 	return rs.suspend() -- the first thread to finish will resume us.
 end
-resolver.query = protect(rs_query)
+rs.query = protect(rs_query)
 
 local function hex4(s)
 	return ('%04x'):format(tonumber(s, 16))
@@ -684,12 +682,12 @@ local function filter_answers(type, key, ret, ...)
 	return t
 end
 
-function resolver:lookup(name, type, timeout)
+function rs:lookup(name, type, timeout)
 	type = type or 'A'
 	return filter_answers(type, type:lower(), self:query(name, type, timeout))
 end
 
-function resolver:reverse_lookup(addr, timeout)
+function rs:reverse_lookup(addr, timeout)
 	local s = arpa_str(addr)
 	if not s then return nil, 'invalid address' end
 	return filter_answers('PTR', 'ptr', self:query(s, 'PTR', timeout))
@@ -701,26 +699,27 @@ if not ... then
 
 	math.randomseed(clock())
 
-	local r = assert(resolver:new{
+	local r = assert(rs:new{
 		nameservers = {
-			--'127.0.0.1', --TODO
-			'10.0.0.1',
+			'127.0.0.1', --TODO
+			--'10.0.0.1',
 			--'10.0.0.10',
 			--'1.1.1.1',
 			--'8.8.8.8',
 			--{host = '8.8.4.4', port = 53},
 		},
-		tcp_only = true,
+		--tcp_only = true,
+		debug = true,
 	})
 
 	local function lookup(q)
 
-		dbg(nil, type(q) == 'string' and {name = q} or q, 'LOOKUP')
 		local s = type(q) == 'string' and q or pp.format(q)
 
 		local answers, err, errcode = r:query(q)
 
 		if not answers then
+			print(errors.is(err))
 			print(format('%s: %s [%s]', s, err, errcode))
 		else
 			for i, ans in ipairs(answers) do
@@ -759,4 +758,4 @@ if not ... then
 end
 
 
-return resolver
+return rs
