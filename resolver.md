@@ -3,6 +3,10 @@
 
 DNS client/resolver in Lua.
 
+## Status
+
+Beta
+
 ## API
 
 ----------------------------------------------- ------------------------------
@@ -41,8 +45,8 @@ Create a resolver object. Options:
 
 ### `r:query(name,[type],[timeout] | t) -> answers`
 
-Perform a DNS query and return a list of parsed DNS records,
-or `nil, err, errcode` for input, network or server errors.
+Perform a DNS query and return a list of parsed DNS records, or `nil, err`
+for input, network or server errors (where `err` is an error object).
 
 Options:
 

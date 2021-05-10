@@ -431,30 +431,29 @@ local function ns_query(rs, ns, q)
 	end
 
 	--queue the query for response before sending it because the scheduler
-	--might recv() even before send() transfers to us!
-	q.thread = rs.currentthread()
+	--might recv() our response even before our send() returns!
 	ns.queue[q.id] = q
 
-	--send the request. being run with resume(), this thread will now suspend
+	--send the request. being resume()'d, this thread will now suspend
 	--itself inside send(), returning control to the calling thread.
-	--the I/O scheduler is then responsible for resuming this thread.
+	--the I/O scheduler will resume this thread next when send() completes.
 	rs:dbg(ns, q, 'SEND.')
 	check_io(q, ns.udp:send(q.s, nil, q.expires))
 	rs:dbg(ns, q, 'SENT')
 
-	--resume the scheduler if it's idle. being called with resume(), it will
-	--suspend itself inside the first recv() call and transfer back to us.
+	--start the scheduler or suspend. the scheduler will resume() us back
+	--on the matching recv() or on timeout.
+	q.thread = rs.currentthread()
+	local buf, len, errcode
 	if not ns.scheduler_running then
 		rs:dbgr(ns, q, ns.scheduler)
-		print(rs.resume(ns.scheduler))
-	end
-
-	--suspend. the scheduler will transfer to us on the matching recv()
-	--with the return values of that recv().
-	rs:dbgs(ns, q)
-	local buf, len, errcode = check_io(q, rs.suspend())
-	if not buf then
-		return nil, len, errcode
+		buf, len, errcode = check_io(q, rs.transfer(ns.scheduler))
+	elseif q.result then
+		rs:dbg(ns, q, 'EARLY', len)
+		buf, len, errcode = check_io(q, glue.unpack(q.result))
+	else
+		rs:dbgs(ns, q)
+		buf, len, errcode = check_io(q, rs.suspend())
 	end
 
 	local answers, err, errcode = parse_response(q, buf, len)
@@ -463,10 +462,6 @@ local function ns_query(rs, ns, q)
 		answers, err, errcode = tcp_query(rs, ns, q)
 	end
 
-	--before returning, we have to resume the scheduler again.
-	rs:dbgr(ns, q, ns.scheduler)
-	rs.resume(ns.scheduler)
-
 	return answers, err, errcode
 end
 local ns_query = protect(ns_query)
@@ -474,6 +469,13 @@ local ns_query = protect(ns_query)
 local function schedule(rs, ns)
 	local sz = 4096
 	local buf = ffi.new('uint8_t[?]', sz)
+	local function respond(q, ...)
+		if q.thread then
+			rs.resume(q.thread, ...)
+		else
+			q.result = glue.pack(...)
+		end
+	end
 	while true do
 		ns.scheduler_running = true
 		while true do
@@ -486,7 +488,7 @@ local function schedule(rs, ns)
 					else
 						q.lost = true
 						rs:dbgt(ns, q, 'TIMEOUT')
-						rs.transfer(q.thread, nil, 'timeout')
+						respond(q, nil, 'timeut')
 					end
 				elseif now > q.expires + 120 then --safe to reuse this id.
 					rs:dbg(ns, q, 'REUSE')
@@ -494,7 +496,7 @@ local function schedule(rs, ns)
 				end
 			end
 			rs:dbg(ns, nil, 'RECV.',
-				DEBUG and min_expires and string.format('%.2f', min_expires - now)
+				rs.debug and min_expires and string.format('%.2f', min_expires - now)
 					or 'ALL EXPIRED')
 			if not min_expires then
 				break
@@ -506,24 +508,25 @@ local function schedule(rs, ns)
 					if not q.lost then
 						q.lost = true
 						rs:dbgt(ns, q, 'ERROR', err, errcode)
-						rs.transfer(q.thread, nil, err, errcode)
+						respond(q, nil, err, errcode)
 					end
 				end
-			end
-			local qid = parse_qid(glue.empty, buf, len)
-			local q = ns.queue[qid]
-			if q then
-				if rs.clock() < q.expires then
-					ns.queue[qid] = nil
-					rs:dbgt(ns, q, 'DATA', len)
-					rs.transfer(q.thread, buf, len)
-				else
-					q.lost = true
-					rs:dbgt(ns, q, 'TIMEOUT')
-					rs.transfer(q.thread, nil, 'timeout')
-				end
 			else
-				rs:dbg(ns, nil, '???', qid)
+				local qid = parse_qid(glue.empty, buf, len)
+				local q = ns.queue[qid]
+				if q then
+					if rs.clock() < q.expires then
+						ns.queue[qid] = nil
+						rs:dbgt(ns, q, 'DATA', len)
+						respond(q, buf, len)
+					else
+						q.lost = true
+						rs:dbgt(ns, q, 'TIMEOUT')
+						respond(q, nil, 'timeout')
+					end
+				else
+					rs:dbg(ns, nil, '???', qid)
+				end
 			end
 		end
 		ns.scheduler_running = false
@@ -586,7 +589,7 @@ local function create_resolver(rs, opt)
 		end, 'N'..i)
 		rs.nst[i] = ns
 		ns.i = i
-		rs:dbg(ns, nil, 'NS', DEBUG and ai:tostring())
+		rs:dbg(ns, nil, 'NS', rs.debug and ai:tostring())
 	end
 
 	rs.cache = lrucache{max_size = rs.max_cache_entries}
@@ -701,26 +704,25 @@ if not ... then
 
 	local r = assert(rs:new{
 		nameservers = {
-			'127.0.0.1', --TODO
+			--'127.0.0.1', --TODO
 			--'10.0.0.1',
-			--'10.0.0.10',
-			--'1.1.1.1',
+			'10.0.0.10',
+			'1.1.1.1',
 			--'8.8.8.8',
 			--{host = '8.8.4.4', port = 53},
 		},
 		--tcp_only = true,
-		debug = true,
+		--debug = true,
 	})
 
 	local function lookup(q)
 
 		local s = type(q) == 'string' and q or pp.format(q)
 
-		local answers, err, errcode = r:query(q)
+		local answers, err = r:query(q)
 
 		if not answers then
-			print(errors.is(err))
-			print(format('%s: %s [%s]', s, err, errcode))
+			print(format('%s: %s', s, err))
 		else
 			for i, ans in ipairs(answers) do
 
@@ -731,9 +733,9 @@ if not ... then
 					ans.ttl))
 
 				if ans.a then
-					local names, err, errcode = r:reverse_lookup(ans.a)
+					local names, err = r:reverse_lookup(ans.a)
 					if not names then
-						print(format('%s: %s [%s]', s, err, errcode))
+						print('', format('%s: %s', s, err))
 					else
 						for i,name in ipairs(names) do
 							print('', ans.a, name)
@@ -746,7 +748,7 @@ if not ... then
 
 	for i,s in ipairs{
 		--{name = 'luapower.com', tcp_only = false, timeout = 1},
-		--{name = 'catcostaocasa.ro', timeout = 1},
+		{name = 'catcostaocasa.ro', timeout = 1},
 		{name = 'www.yahoo.com', timeout = 1},
  		--'www.openresty.org',
 		--'www.lua.org',
