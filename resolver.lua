@@ -704,8 +704,8 @@ if not ... then
 
 	local r = assert(rs:new{
 		nameservers = {
-			--'127.0.0.1', --TODO
-			--'10.0.0.1',
+			'127.0.0.1',
+			'10.0.0.1',
 			'10.0.0.10',
 			'1.1.1.1',
 			--'8.8.8.8',
@@ -750,8 +750,8 @@ if not ... then
 		--{name = 'luapower.com', tcp_only = false, timeout = 1},
 		{name = 'catcostaocasa.ro', timeout = 1},
 		{name = 'www.yahoo.com', timeout = 1},
- 		--'www.openresty.org',
-		--'www.lua.org',
+ 		'www.openresty.org',
+		'www.lua.org',
 	} do
 		r.resume(r.newthread(lookup, 'L'..i), s)
 	end
