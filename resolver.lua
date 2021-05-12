@@ -546,6 +546,7 @@ local function bind_libs(self, libs)
 			self.newthread = sock.newthread
 			self.suspend = sock.suspend
 			self.resume = sock.resume
+			self.thread = sock.thread
 			self.transfer = sock.transfer
 			self.currentthread = sock.currentthread
 			self.start = sock.start
