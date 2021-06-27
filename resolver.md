@@ -10,7 +10,7 @@ Beta
 ## API
 
 ----------------------------------------------- ------------------------------
-`resolver:new(t) -> r`                          create a resolver
+`resolver.new(t) -> r`                          create a resolver
 `r:query(name,[type],[timeout] | t) -> answers` query
 `r:lookup(name,[type],[timeout]) -> addresses`  name lookup
 `r:reverse_lookup(address,[timeout]) -> hosts`  reverse lookup
@@ -34,10 +34,11 @@ comes first. This results in the best lookup times and impact-free
 
 Create a resolver object. Options:
 
-* `nameservers`
+* `servers`
 
-	a list of DNS server IP addresses. Each entry can be either a hostname
-	or a table of form `{host=, [port=], [tcp_only=true]}`.
+	a list (space-separated string or array) of DNS server IP addresses.
+	Each entry can be either a hostname or a table of form
+	`{host=, [port=], [tcp_only=true]}`.
 
 * `max_cache_entries`
 

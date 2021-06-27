@@ -557,7 +557,7 @@ local function bind_libs(self, libs)
 	end
 end
 
-local function create_resolver(rs, opt)
+local function create_resolver(opt)
 	local rs = glue.update({}, rs, opt)
 
 	if not rs.debug then
@@ -571,8 +571,11 @@ local function create_resolver(rs, opt)
 		bind_libs(rs, rs.libs)
 	end
 
+	local servers = type(rs.servers) == 'string'
+		and glue.collect(rs.servers:gmatch'[^%s]+') or rs.servers
+
 	rs.nst = {}
-	for i,ns in ipairs(rs.nameservers) do
+	for i,ns in ipairs(rs.servers) do
 		local host, port, tcp_only
 		if type(ns) == 'table' then
 			host = ns.host or ns[1]
@@ -703,8 +706,8 @@ if not ... then
 
 	math.randomseed(clock())
 
-	local r = assert(rs:new{
-		nameservers = {
+	local r = assert(rs.new{
+		servers = {
 			'127.0.0.1',
 			'10.0.0.1',
 			'10.0.0.10',
