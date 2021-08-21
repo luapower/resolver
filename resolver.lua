@@ -21,52 +21,10 @@ local concat = table.concat
 
 --error handling -------------------------------------------------------------
 
---[[
-
-Errors raised with with check() and check_io() instead of assert() or error()
-enable methods wrapped with protect() to catch those errors, free temporary
-resources and return nil,err instead of raising.
-
-We distinguish between many types of errors:
-- input validation errors, which can be user-corrected so they mustn't raise.
-- invalid API usage, i.e. bugs on this side, which raise.
-- response validation errors, i.e. bugs on the other side which don't raise.
-- I/O errors, i.e. network failures which can be temporary and thus make the
-  call retriable, so they must be distinguishable from other types of errors.
-
-]]
-
-local dns_error  = errors.errortype'dns'
-local sock_error = errors.errortype'socket'
-
-local function check(q, v, ...)
-	if v then return v, ... end
-	local err, errcode = ...
-	errors.raise(dns_error{tcp = q.tcp, message = err, errorcode = errcode,
-		addtraceback = q.tracebacks})
-end
+local check_io, check, protect = errors.tcp_protocol_errors'dns'
 
 local function check_len(q, i, n, len)
 	return check(q, n >= i+len, 'response too short')
-end
-
-function dns_error:init()
-	if self.tcp then
-		self.tcp:close(0)
-		self.tcp = nil
-	end
-end
-sock_error.init = dns_error.init
-
-local function check_io(q, v, ...)
-	if v then return v, ... end
-	local err, errcode = ...
-	errors.raise(sock_error{tcp = q and q.tcp, message = err, errorcode = errcode,
-		addtraceback = q and q.tracebacks})
-end
-
-local function protect(f)
-	return errors.protect('dns socket', f)
 end
 
 --build request --------------------------------------------------------------
@@ -630,7 +588,7 @@ local function rs_query(rs, qname, qtype, timeout)
 				rs:dbg(ns, q, 'DISCARD (late)')
 				return
 			end
-			if not res and errors.is(err, 'socket') and queries_left > 0 then
+			if not res and errors.is(err, 'tcp') and queries_left > 0 then
 				rs:dbg(ns, q, 'DISCARD (socket error and not last)')
 				return
 			end
