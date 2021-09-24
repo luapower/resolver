@@ -339,15 +339,15 @@ local function tcp_query(rs, ns, q)
 	local expires = q.expires
 
 	check_io(q, tcp:connect(ns.ai, nil, expires))
-	check_io(q, tcp:sendall(u16_str(#q.s) .. q.s, nil, expires))
+	check_io(q, tcp:send(u16_str(#q.s) .. q.s, nil, expires))
 
 	local len_buf = ffi.new'uint8_t[2]'
-	check_io(q, tcp:recvall(len_buf, 2, expires))
+	check_io(q, tcp:recvn(len_buf, 2, expires))
 	local len = u16(q, len_buf, 0, 2)
 	check(q, len <= 4096, 'response too long')
 
 	local buf = ffi.new('uint8_t[?]', len)
-	check_io(q, tcp:recvall(buf, len, expires))
+	check_io(q, tcp:recvn(buf, len, expires))
 
 	tcp:close(0)
 	q.tcp = nil
