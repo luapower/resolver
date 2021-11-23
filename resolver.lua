@@ -239,7 +239,7 @@ local function parse_response(q, p, n)
 	local answers = {}
 
 	local code = band(flags, 0xf)
-	check(q, code == 0, resolver_err_strs[code] or 'unknown', code)
+	check(q, code == 0, resolver_err_strs[code] or 'unknown [%d]', code)
 
 	local additional_section = q.additional_section
 	local authority_section = q.type == 'SOA' or q.authority_section
