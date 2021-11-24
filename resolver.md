@@ -3,9 +3,10 @@
 
 DNS client/resolver in Lua.
 
-## Status
-
-Beta
+Ripped from OpenResty, cleaned up and changed the logic to always hit
+all servers at once and return the first reply and discard the rest.
+Many resolvers are starting to catch up to the idea that this is the way
+to do it (eg. the Mac OS resolver works this way).
 
 ## API
 
