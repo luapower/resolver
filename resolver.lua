@@ -21,10 +21,10 @@ local concat = table.concat
 
 --error handling -------------------------------------------------------------
 
-local check_io, check, protect = errors.tcp_protocol_errors'dns'
+local check_io, checkp, _, protect = errors.tcp_protocol_errors'dns'
 
 local function check_len(q, i, n, len)
-	return check(q, n >= i+len, 'response too short')
+	return checkp(q, n >= i+len, 'response too short')
 end
 
 --build request --------------------------------------------------------------
@@ -44,7 +44,7 @@ local qtypes = {
 
 local function name_str(q)
 	local function label_str(s)
-		check(q, #s <= 63, 'name part too long')
+		checkp(q, #s <= 63, 'name part too long')
 		return char(#s)..s
 	end
 	return q.name:gsub('([^.]+)%.?', label_str)..'\0'
@@ -55,7 +55,7 @@ local function u16_str(x)
 end
 
 local function query_str(q) --query: name qtype(2) class(2)
-	check(q, q.name:sub(1, 1) ~= '.', 'name starts with a dot')
+	checkp(q, q.name:sub(1, 1) ~= '.', 'name starts with a dot')
 	local qtype = qtypes[q.type] or tonumber(q.type)
 	return name_str(q)..u16_str(qtype)..'\0\1'
 end
@@ -64,7 +64,7 @@ end
 --them vulnerable to amplification attacks, so we don't implement them either.
 --NOTE: queries with a single name cannot be > 512 bytes, the UDP sending limit.
 local function request_str(q)
-	check(q, #q.name <= 253, 'name too long')
+	checkp(q, #q.name <= 253, 'name too long')
 	local flags = q.recurse and '\1\0' or '\0\0'
 	--request: id(2) flags(2) query_num(2) zero(2) zero(2) zero(2) query
 	return u16_str(q.id)..flags..'\0\1\0\0\0\0\0\0'..query_str(q)
@@ -104,7 +104,7 @@ end
 local function label(q, p, i, n, maxlen) --string: len(1) text
 	check_len(q, i, n, 1)
 	local len = p[i]; i=i+1
-	check(q, len > 0 and len <= maxlen, 'response too short')
+	checkp(q, len > 0 and len <= maxlen, 'response too short')
 	check_len(q, i, n, len)
 	return ffi.string(p+i, len), i+len
 end
@@ -128,7 +128,7 @@ local function name(q, p, i, n) --name: label1... end|pointer
 		end
 	end
 	local s = concat(labels, '.')
-	check(q, #s <= 253, 'name too long')
+	checkp(q, #s <= 253, 'name too long')
 	return s, i
 end
 
@@ -224,22 +224,22 @@ local function parse_response(q, p, n)
 	if band(flags, 0x200) ~= 0 then
 		return nil, 'truncated'
 	end
-	check(q, band(flags, 0x8000) ~= 0, 'bad QR flag')
+	checkp(q, band(flags, 0x8000) ~= 0, 'bad QR flag')
 
 	--skip question section: (qname qtype(2) qclass(2)) ...
 	for _ = 1, n1 do
 		local qname; qname, i = name(q, p, i, n)
 		local qtype; qtype, i = u16(q, p, i, n)
 		local class; class, i = u16(q, p, i, n)
-		check(q, qname == q.name         , 'response name mismatch')
-		check(q, qtype == qtypes[q.type] , 'response type mismatch')
-		check(q, class == 1              , 'response class not 1')
+		checkp(q, qname == q.name         , 'response name mismatch')
+		checkp(q, qtype == qtypes[q.type] , 'response type mismatch')
+		checkp(q, class == 1              , 'response class not 1')
 	end
 
 	local answers = {}
 
 	local code = band(flags, 0xf)
-	check(q, code == 0, resolver_err_strs[code] or 'unknown [%d]', code)
+	checkp(q, code == 0, resolver_err_strs[code] or 'unknown [%d]', code)
 
 	local additional_section = q.additional_section
 	local authority_section = q.type == 'SOA' or q.authority_section
@@ -344,7 +344,7 @@ local function tcp_query(rs, ns, q)
 	local len_buf = ffi.new'uint8_t[2]'
 	check_io(q, tcp:recvn(len_buf, 2, expires))
 	local len = u16(q, len_buf, 0, 2)
-	check(q, len <= 4096, 'response too long')
+	checkp(q, len <= 4096, 'response too long')
 
 	local buf = ffi.new('uint8_t[?]', len)
 	check_io(q, tcp:recvn(buf, len, expires))
